@@ -64,14 +64,14 @@
 
 				function send_resize() {
 					var canvas = document.getElementById('canvas');
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
 					e.web_window_size_changed(canvas.width, canvas.height);
 				}
 
-                /*
-				window.addEventListener('resize', function(event) {
-					send_resize();
+                window.addEventListener('resize', function(event) {
+        			send_resize();
 				}, true);
-				*/
 
 				// This can probably be done better: Ideally we'd feed the
 				// initial size to `main_start`. But there seems to be a

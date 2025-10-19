@@ -93,6 +93,7 @@ fi
 emcc \
     -o "index.html" \
     "game.wasm.o" \
+    "src/clay-odin/wasm/clay.o" \
     "$BUILD_PATH/$SDL_LIBRARY" \
     "$BUILD_PATH/$SDLIMG_LIBRARY" \
     "$BUILD_PATH/$SDLTTF_LIBRARY" \
