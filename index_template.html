@@ -64,8 +64,10 @@
 
 				function send_resize() {
 					var canvas = document.getElementById('canvas');
-        canvas.width = window.innerWidth;
-        canvas.height = window.innerHeight;
+					canvas.width = window.innerWidth * devicePixelRatio;
+					canvas.height = window.innerHeight * devicePixelRatio;
+					canvas.style.setProperty("width", window.innerWidth + "px")
+					canvas.style.setProperty("height", window.innerHeight + "px")
 					e.web_window_size_changed(canvas.width, canvas.height);
 				}
 

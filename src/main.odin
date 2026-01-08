@@ -1,7 +1,6 @@
 
 package main
 
-
 import SDL "vendor:sdl3"
 import IMG "vendor:sdl3/image"
 import TTF "vendor:sdl3/ttf"
@@ -9,7 +8,8 @@ import TTF "vendor:sdl3/ttf"
 
 import "core:fmt"
 import "core:c"
-// import "core:os"
+import "core:strings"
+import "core:log"
 
 import "base:runtime"
 
@@ -22,40 +22,135 @@ ctx: runtime.Context
 
 window: ^SDL.Window
 renderer: ^SDL.Renderer
-texture: ^SDL.Texture
-texture_size: [2]i32
 engine: ^TTF.TextEngine
 font: ^TTF.Font
 text: ^TTF.Text
 
-// @(export) emscripten_cancel_main_loop :: proc "c" () {
-
-// }
-// @(export) abort :: proc "c" () {
-
-// }
 
 clay_memory: []byte
 
-win_size: [2]i32
+win_size: [2]i32 = {640, 480}
 
-@export
-main_start :: proc "c" () {
+///////////////////////////////////////////////////////
+// desktop/wasm handling
 
-    sdl_app_init(nil, 0, nil)
+when ODIN_ARCH == .wasm32 || ODIN_ARCH == .wasm64p32 {
+
+	@export
+	main_start :: proc "c" () {
+		sdl_app_init(nil, 0, nil)
+	}
+
+	@export
+	web_window_size_changed :: proc "c" (w: c.int, h: c.int) {
+		SDL.SetWindowSize(window, w, h)
+	}
+
+	@export
+	main_update :: proc "c" () -> bool {
+		event: SDL.Event
+		context = ctx
+		for (SDL.PollEvent(&event)) {
+			sdl_app_event(nil, &event)
+		}
+		return sdl_app_iterate(nil) == .CONTINUE
+	}
 
 
-    context = ctx
-    request_data("/sample.jpg", assign_texture)
-    request_data("/Play-Regular.ttf", assign_font)
-
-    min_size := clay.MinMemorySize()
-
-    clay_memory = make([]byte, min_size)
-    clay_arena := clay.CreateArenaWithCapacityAndMemory(uint(min_size), &clay_memory[0])
-    clay.Initialize(clay_arena, {640, 480}, { handler = clay_error_handler })
-    clay.SetMeasureTextFunction(clay_measure_text, nil)
+	@export
+	main_end :: proc "c" () {
+		sdl_app_quit(nil, {})
+	}
 }
+
+main :: proc () {
+	fmt.println("main")
+	context.logger = log.create_console_logger()
+    ctx = context
+    //args := os.args
+	when ODIN_ARCH == .wasm32 || ODIN_ARCH == .wasm64p32 {
+	} else {
+        SDL.EnterAppMainCallbacks(0, nil, sdl_app_init, sdl_app_iterate, sdl_app_event, sdl_app_quit)
+    }
+}
+
+
+///////////////////////////////////////////////////////
+
+RequestResult :: struct {
+	success: bool,
+	bytes: []byte,
+	user_data: rawptr,
+}
+
+RequestHandler :: struct {
+	ctx: runtime.Context,
+	user_handler: proc(result: RequestResult),
+	user_data: rawptr,
+}
+
+
+// async on web, synchronous on desktop
+request_data :: proc (url: cstring, user_data: rawptr, callback: proc(result: RequestResult)) {
+	when ODIN_ARCH == .wasm32 || ODIN_ARCH == .wasm64p32 {
+		fetch_attr := emscripten.emscripten_fetch_attr_t {}
+		emscripten.emscripten_fetch_attr_init(&fetch_attr)
+		fetch_attr.onsuccess = fetch_success
+		fetch_attr.onerror = fetch_error
+		fetch_attr.attributes = emscripten.EMSCRIPTEN_FETCH_LOAD_TO_MEMORY
+
+		callback_info := new(RequestHandler)
+		callback_info.user_handler = callback
+		callback_info.user_data = user_data
+		callback_info.ctx = context
+
+		fetch_attr.userData = callback_info
+		emscripten.emscripten_fetch(&fetch_attr, url)
+	} else {
+
+		file_size: uint = ---
+		file_data :=  ([^]byte) (SDL.LoadFile(url, &file_size))
+
+		result := RequestResult {
+			success = true,
+			bytes = file_data[0:file_size],
+			user_data = user_data,
+		}
+
+		callback(result)
+
+	}
+}
+
+
+fetch_error :: proc "c" (fetch_result: ^emscripten.emscripten_fetch_t) {
+	request_handler := (^RequestHandler)(fetch_result.userData)
+	context = request_handler.ctx
+	result := RequestResult {
+		success = false,
+		user_data = request_handler.user_data,
+	}
+    request_handler.user_handler(result)
+	free(request_handler)
+}
+
+
+fetch_success :: proc "c" (fetch_result: ^emscripten.emscripten_fetch_t) {
+	request_handler := (^RequestHandler)(fetch_result.userData)
+	context = request_handler.ctx
+	result := RequestResult {
+		success = true,
+		user_data = request_handler.user_data,
+		bytes = (([^]byte)(fetch_result.data))[0:fetch_result.numBytes],
+	}
+
+    request_handler.user_handler(result)
+	free(request_handler)
+}
+
+
+
+///////////////////////////////////////////////////////
 
 clay_error_handler :: proc "c" (errorData: clay.ErrorData) {
     context = ctx
@@ -73,12 +168,46 @@ clay_measure_text :: proc "c" (
     }
 }
 
-assign_texture :: proc (bytes: []byte) {
-    io := SDL.IOFromConstMem(&bytes[0], len(bytes))
-    texture = IMG.LoadTexture_IO(renderer, io, false)
+GalleryImage :: struct {
+	img_path: string,
+	bytes: []byte,
+	texture: ^SDL.Texture,
 }
 
-assign_font :: proc (bytes: []byte) {
+images: [dynamic]GalleryImage
+
+parse_files :: proc (result: RequestResult) {
+	bytes := result.bytes
+    file := string(bytes)
+
+    for path in strings.split_iterator(&file, "\n") {
+		image := GalleryImage {
+			img_path = path
+		}
+		ImgPath :: struct {
+			index: uint
+		}
+		img_idx := uint(len(images))
+
+        append(&images, image) // crash on web
+        full_path := fmt.tprintf("content/%s", path)
+
+		c_path := strings.clone_to_cstring(full_path)
+
+		img_path := new(ImgPath)
+		img_path^ = {img_idx}
+		request_data(c_path, img_path, proc(result: RequestResult) {
+			img_path := (^ImgPath)(result.user_data)
+			bytes := result.bytes
+			io := SDL.IOFromConstMem(&bytes[0], len(bytes))
+			image := &images[img_path.index]
+			image.texture = IMG.LoadTexture_IO(renderer, io, false)
+		})
+    }
+}
+
+assign_font :: proc (result: RequestResult) {
+	bytes := result.bytes
     io := SDL.IOFromConstMem(&bytes[0], len(bytes))
     font = TTF.OpenFontIO(io, false, 16)
 
@@ -88,53 +217,14 @@ assign_font :: proc (bytes: []byte) {
 
     text = TTF.CreateText(engine, font, "My Text", 0)
     TTF.SetTextColor(text, 255, 255, 255, 255)
-
 }
 
-fetch_success :: proc "c" (result: ^emscripten.emscripten_fetch_t) {
-    context = ctx
-
-    data: [^]byte = ([^]byte)(result.data)
-    size: int = (int)(result.numBytes)
-    if size == 0 {
-       return
-    }
-
-    bytes := data[0:size]
-    callback := (proc(bytes: []byte))(result.userData)
-    callback(bytes)
-}
-
-
-request_data :: proc (url: cstring, callback: proc(bytes: []byte)) {
-    fetch_attr := emscripten.emscripten_fetch_attr_t {}
-    emscripten.emscripten_fetch_attr_init(&fetch_attr)
-    fetch_attr.onsuccess = fetch_success
-    fetch_attr.attributes = emscripten.EMSCRIPTEN_FETCH_LOAD_TO_MEMORY
-    fetch_attr.userData = rawptr(callback)
-    emscripten.emscripten_fetch(&fetch_attr, url)
-}
-
-@export
-main_update :: proc "c" () -> bool {
-    return sdl_app_iterate(nil) == .CONTINUE
-}
-
-@export
-main_end :: proc "c" () {
-    sdl_app_quit(nil, {})
-}
-
-@export
-web_window_size_changed :: proc "c" (w: c.int, h: c.int) {
-    win_size = {w, h}
-    SDL.SetWindowSize(window, w, h)
-}
 
 
 
 sdl_app_init :: proc "c" (appstate: ^rawptr, argc: i32, argv: [^]cstring) -> SDL.AppResult {
     context = ctx
+    fmt.println("hello")
     _ = SDL.SetAppMetadata("Example", "1.0", "com.example")
 
     if (!SDL.Init(SDL.INIT_VIDEO)) {
@@ -146,132 +236,196 @@ sdl_app_init :: proc "c" (appstate: ^rawptr, argc: i32, argv: [^]cstring) -> SDL
         return .FAILURE
     }
 
-    if (!SDL.CreateWindowAndRenderer("examples", 640, 480, {}, &window, &renderer)){
+    if (!SDL.CreateWindowAndRenderer("examples", win_size.x, win_size.y, {}, &window, &renderer)){
         return .FAILURE
     }
+	SDL.SetWindowResizable(window, true)
 
     engine = TTF.CreateRendererTextEngine(renderer)
 
+
+    context = ctx
+    request_data("Play-Regular.ttf", nil, assign_font)
+    request_data("content/files.txt", nil, parse_files)
+
+    min_size := clay.MinMemorySize()
+
+    clay_memory = make([]byte, min_size)
+    clay_arena := clay.CreateArenaWithCapacityAndMemory(uint(min_size), &clay_memory[0])
+    clay.Initialize(clay_arena, {f32(win_size.x), f32(win_size.y)}, { handler = clay_error_handler })
+    clay.SetMeasureTextFunction(clay_measure_text, nil)
+
     return .CONTINUE
 }
+
+
+sdl_app_quit :: proc "c" (appstate: rawptr, result: SDL.AppResult) {
+	context = ctx
+    fmt.println("quit")
+}
+
 
 sdl_app_event :: proc "c" (appstate: rawptr, event: ^SDL.Event) -> SDL.AppResult {
     context = ctx
-    fmt.println(event)
-    if event.type == .QUIT {
-        return .SUCCESS
-    }
-    return .CONTINUE
+	ui_dirty = true
+    retval := SDL.AppResult.CONTINUE
+	#partial switch event.type {
+	case .MOUSE_MOTION :
+			clay.SetPointerState({event.motion.x, event.motion.y}, (event.motion.state & SDL.BUTTON_LMASK) != {} )
+	case .MOUSE_BUTTON_DOWN:
+			if event.button.button == SDL.BUTTON_LEFT {
+				clay.SetPointerState({event.button.x, event.button.y}, true)
+			}
+	case .MOUSE_BUTTON_UP:
+			if event.button.button == SDL.BUTTON_LEFT {
+				clay.SetPointerState({event.button.x, event.button.y}, false)
+			}
+	case .QUIT:
+		retval = .SUCCESS
+	case .WINDOW_RESIZED:
+		//fmt.println("event windiw_resized:", event.window)
+		win_size = {event.window.data1, event.window.data2}
+	case:
+		//fmt.println("event.type:", event.type)
+
+	}
+    return retval
 }
+
+
+last_ticks : u64 = 0
+
+desired_delay_ticks: u64 = 1_000_000_000 / 60
+
+next_iterate_ticks: u64 = 0
+
+
+
 
 sdl_app_iterate :: proc "c" (appstate: rawptr) -> SDL.AppResult {
     context = ctx
-    //fmt.println("hello")
 
-    SDL.SetRenderDrawColor(renderer, 0, 0, 0, 255)
-    //SDL.RenderClear(renderer)
+	current_ticks := SDL.GetTicksNS()
+	missing_ticks: i64 = i64(next_iterate_ticks) - i64(current_ticks)
 
-    rect := SDL.FRect{w = f32(texture_size.x), h = f32(texture_size.y)}
-    rect.w = 100
-    rect.h = 100
+	if missing_ticks > 0 {
+		SDL.DelayNS(u64(missing_ticks))
+	}
 
-    //SDL.SetRenderDrawBlendMode(renderer, .ADD)
-    SDL.SetRenderDrawColor(renderer, 255, 0, 0, 255)
-    SDL.RenderFillRect(renderer, &rect)
-    SDL.SetRenderDrawColor(renderer, 255, 0, 255, 255)
-    SDL.RenderRect(renderer, &rect)
+	actual_ticks := SDL.GetTicksNS()
+	delta_ticks := actual_ticks - last_ticks
+	last_ticks = actual_ticks
+	next_iterate_ticks = actual_ticks + desired_delay_ticks
 
-    if texture != nil {
-       rect.w = f32(texture.w)
-       rect.h = f32(texture.h)
-       SDL.RenderTexture(renderer, texture, nil, &rect)
-    }
+	delta_time := f64(delta_ticks) / 1000000000.0
 
-    if text != nil {
-        TTF.DrawRendererText(text, 100, 100)
-    }
+	app_tick(delta_time)
 
-    clay.SetLayoutDimensions({f32(win_size.x), f32(win_size.y)})
-    render_commands := create_layout()
-
-    for idx in 0..<i32(render_commands.length) {
-        render_command := clay.RenderCommandArray_Get(&render_commands, idx)
-        #partial switch render_command.commandType {
-        case .Rectangle:
-            //fmt.println(render_command)
-            rect := render_command.renderData.rectangle
-            color := rect.backgroundColor
-            SDL.SetRenderDrawColor(renderer, u8(color[0]), u8(color[1]), u8(color[2]), u8(color[3]))
-
-            box := render_command.boundingBox
-            rect2 := SDL.FRect{
-                w = box.width,
-                h = box.height,
-                x = box.x,
-                y = box.y,
-            }
-            SDL.RenderFillRect(renderer, &rect2)
-        case .Text:
-            //fmt.println(render_command)
-            box := render_command.boundingBox
-            text_data := render_command.renderData.text
-            color := text_data.textColor
-
-            if text != nil {
-                TTF.SetTextColor(text, u8(color[0]), u8(color[1]), u8(color[2]), u8(color[3]))
-                string_slice := text_data.stringContents
-                TTF.SetTextString(text, cstring(string_slice.chars), uint(string_slice.length))
-                TTF.SetTextWrapWidth(text, i32(box.width))
-                TTF.DrawRendererText(text, box.x, box.y)
-            }
-        case .Image:
-
-            box := render_command.boundingBox
-            rect2 := SDL.FRect{
-                w = box.width,
-                h = box.height,
-                x = box.x,
-                y = box.y,
-            }
-            tex := (^SDL.Texture)(render_command.renderData.image.imageData)
-            SDL.RenderTexture(renderer, texture, nil, &rect2)
-
-        case:
-        	// hello
-        	fmt.println(render_command)
-        }
-
-    }
-
-    SDL.RenderPresent(renderer)
-
-
-
-    return .CONTINUE
+	app_draw()
+	return .CONTINUE
 }
+
+SlideState :: enum {
+	Showing,
+	Transitioning,
+}
+
+current_state: SlideState
+
+current_show_time: f64
+max_show_time: f64 = 5.0
+
+current_transition_time: f64
+transition_time: f64 = 1.0
+
+current_img_idx := 0
+
+
+app_tick :: proc (dt: f64) {
+	if current_state == .Showing {
+		current_show_time += dt
+		if current_show_time >= max_show_time {
+			current_transition_time = 0
+			current_state = .Transitioning
+		}
+	} else if current_state == .Transitioning {
+		current_transition_time += dt
+		ui_dirty = true
+		if current_transition_time >= transition_time {
+			current_state = .Showing
+			current_show_time = 0
+			current_img_idx = get_next_img_idx(current_img_idx)
+		}
+	}
+}
+
+get_next_img_idx :: proc(idx: int) -> int {
+	return (idx + 1) % len(images)
+}
+
+
+app_draw :: proc () {
+	if ui_dirty {
+		ui_dirty = false
+
+/*
+        SDL.SetRenderDrawColor(renderer, 0, 0, 0, 255)
+		//SDL.RenderClear(renderer)
+
+		rect := SDL.FRect{w = f32(texture_size.x), h = f32(texture_size.y)}
+		rect.w = 100
+		rect.h = 100
+
+		//SDL.SetRenderDrawBlendMode(renderer, .ADD)
+		SDL.SetRenderDrawColor(renderer, 255, 0, 0, 255)
+		SDL.RenderFillRect(renderer, &rect)
+		SDL.SetRenderDrawColor(renderer, 255, 0, 255, 255)
+		SDL.RenderRect(renderer, &rect)
+
+		if texture != nil {
+			rect.w = f32(texture.w)
+			rect.h = f32(texture.h)
+			SDL.RenderTexture(renderer, texture, nil, &rect)
+		}
+
+		if text != nil {
+			TTF.DrawRendererText(text, 100, 100)
+		}
+
+*/
+		clay.SetLayoutDimensions({f32(win_size.x), f32(win_size.y)})
+		free_all(context.temp_allocator)
+		render_commands := create_layout()
+		render_layout(&render_commands)
+
+		SDL.RenderPresent(renderer)
+	}
+}
+
+
+
+
+
+
+ui_dirty: bool = true
 
 // Define some colors.
 COLOR_LIGHT :: clay.Color{224, 215, 210, 255}
 COLOR_RED :: clay.Color{168, 66, 28, 255}
-COLOR_ORANGE :: clay.Color{225, 138, 50, 255}
+COLOR_ORANGE :: clay.Color{0, 138, 50, 255}
+COLOR_ORANGE_LIGHT :: clay.Color{50, 188, 100, 255}
 COLOR_BLACK :: clay.Color{0, 0, 0, 255}
 
-// Layout config is just a struct that can be declared statically, or inline
-
-
-// Re-useable components are just normal procs.
-sidebar_item_component :: proc(index: u32) {
-    sidebar_item_layout := clay.LayoutConfig {
-        sizing = {
-            width = clay.SizingGrow({}),
-            height = clay.SizingFixed(50)
-        },
-    }
-    if clay.UI(clay.ID("SidebarBlob", index))({
-        layout = sidebar_item_layout,
-        backgroundColor = COLOR_ORANGE,
-    }) {}
+COLOR_IMAGES := []clay.Color {
+	{255,    0,    0, 255},
+	{255,  255,    0, 255},
+	{  0,  255,    0, 255},
+	{  0,  255,  255, 255},
+	{  0,    0,  255, 255},
+	{255,    0,  255, 255},
 }
+
+// Layout config is just a struct that can be declared statically, or inline
 
 
 // An example function to create your layout tree
@@ -287,77 +441,214 @@ create_layout :: proc() -> clay.ClayArray(clay.RenderCommand) {
             padding = { 16, 16, 16, 16 },
             childGap = 16,
         },
-        backgroundColor = { 250, 250, 255, 255 },
+		backgroundColor = {0, 0, 0, 255}
     }) {
-        if clay.UI(clay.ID("SideBar"))({
+
+		if len(images) > 0 {
+
+			back_color := clay.Color{255, 255, 255, 255}
+			curr_img_tex := images[current_img_idx].texture
+			if clay.UI(clay.ID("Background"))({
+				floating = {
+					attachTo = .Parent,
+					attachment = {
+						element = .CenterCenter,
+						parent = .CenterCenter,
+					},
+				},
+				layout = {
+					sizing = {
+						width = clay.SizingPercent(1),
+						height = clay.SizingPercent(1),
+					},
+				},
+				backgroundColor = back_color,
+				image = {
+					imageData = curr_img_tex
+				},
+				aspectRatio = {f32(curr_img_tex.w) / f32(curr_img_tex.h)}
+			}) {
+
+			}
+
+			if current_state == .Transitioning {
+				next_img_idx := get_next_img_idx(current_img_idx)
+				next_img_tex := images[next_img_idx].texture
+				front_color := clay.Color{255, 255, 255, 255}
+				progress := current_transition_time / transition_time
+				alpha := f32(progress * 255)
+				front_color.a = alpha
+				if clay.UI(clay.ID("BlendIn"))({
+					floating = {
+						attachTo = .Parent,
+						attachment = {
+							element = .CenterCenter,
+							parent = .CenterCenter,
+						},
+					},
+					layout = {
+						sizing = {
+							width = clay.SizingPercent(1),
+							height = clay.SizingPercent(1),
+						},
+					},
+					backgroundColor = front_color,
+					image = {
+						imageData = next_img_tex
+					},
+					aspectRatio = {f32(next_img_tex.w) / f32(next_img_tex.h)}
+				}) { }
+
+			}
+		}
+
+
+        if clay.UI(clay.ID("ToolBar"))({
             layout = {
-                layoutDirection = .TopToBottom,
-                sizing = { width = clay.SizingFixed(300), height = clay.SizingGrow({}) },
-                padding = { 16, 16, 16, 16 },
+                layoutDirection = .LeftToRight,
+                sizing = { width = clay.SizingFit(), height = clay.SizingFit() },
                 childGap = 16,
             },
-            backgroundColor = COLOR_LIGHT,
+			floating = {
+				attachTo = .Parent,
+				attachment = {
+					element = .CenterBottom,
+					parent = .CenterBottom,
+				},
+				offset = {0, -16},
+			},
         }) {
-            if clay.UI(clay.ID("ProfilePictureOuter"))({
-                layout = {
-                    sizing = { width = clay.SizingGrow({}) },
-                    padding = { 16, 16, 16, 16 },
-                    childGap = 16,
-                    childAlignment = { y = .Center },
-                },
-                backgroundColor = COLOR_RED,
-                cornerRadius = { 6, 6, 6, 6 },
-            }) {
-                if clay.UI(clay.ID("ProfilePicture"))({
-                    layout = {
-                        sizing = { width = clay.SizingFixed(60), height = clay.SizingFixed(60) },
-                    },
-                    image = {
-                        imageData = texture, //&profile_picture,
-                    },
-                }) {}
 
-                clay.Text(
-                    "Clay - UI Library",
-                    clay.TextConfig({ textColor = COLOR_LIGHT, fontSize = 16 }),
+			toolbar := clay.ElementDeclaration {
+				layout = { layoutDirection = .TopToBottom },
+				backgroundColor = COLOR_LIGHT,
+			}
+
+			if clay.UI(clay.ID("ToolBarSection"))(toolbar) {
+				clay.Text(
+                    "Gallery Config",
+                    clay.TextConfig({ textColor = COLOR_RED, fontSize = 16 }),
                 )
-            }
 
-            // Standard Odin code like loops, etc. work inside components.
-            // Here we render 5 sidebar items.
-            for i in u32(0)..<5 {
-                sidebar_item_component(i)
-            }
+				if clay.UI()({
+					layout = {layoutDirection = .LeftToRight}
+				}){
+					sidebar_item_component("Select Folder", proc(c: rawptr) {
+						select_directory()
+					})
+					sidebar_item_component("Config Online Src")
+				}
+			}
+
+			if clay.UI(clay.ID("ToolBarSection2"))(toolbar) {
+				clay.Text(
+                    "Slideshow",
+                    clay.TextConfig({ textColor = COLOR_RED, fontSize = 16 }),
+                )
+				if clay.UI()({
+					layout = {layoutDirection = .LeftToRight}
+				}){
+					sidebar_item_component("First", proc(c: rawptr) { playback_first()})
+					sidebar_item_component("Previous", proc(c: rawptr) { playback_previous()})
+					sidebar_item_component("PlayPause", proc(c: rawptr) { playback_playpause()})
+					sidebar_item_component("Next", proc(c: rawptr) { playback_next()})
+					sidebar_item_component("Last", proc(c: rawptr) { playback_last()})
+				}
+			}
+
         }
-
-        if clay.UI(clay.ID("MainContent"))({
-            layout = {
-                sizing = { width = clay.SizingGrow({}), height = clay.SizingGrow({}) },
-            },
-            backgroundColor = COLOR_LIGHT,
-        }) {}
     }
 
     // Returns a list of render commands
     return clay.EndLayout()
 }
 
-sdl_app_quit :: proc "c" (appstate: rawptr, result: SDL.AppResult) {
-    // fmt.println("quit")
+select_directory :: proc() {
+	fmt.println("select_directory")
+	SDL.ShowOpenFolderDialog(select_directory_callback, nil, nil, nil, true)
+}
+
+select_directory_callback: SDL.DialogFileCallback : proc "c" (userdata: rawptr, filelist: [^]cstring, filter: c.int) {
+	context = ctx
+	if filelist == nil {
+		error := SDL.GetError()
+		fmt.println("got error:", error)
+	} else {
+		fmt.println("got file list: ", filelist)
+	}
 
 }
 
-main :: proc() {
-ctx = context
+playback_first :: proc() {
+	fmt.println("first")
+}
+playback_previous :: proc() {
+	fmt.println("previous")
+}
+playback_playpause :: proc() {
+	fmt.println("playpause")
+}
+playback_next :: proc() {
+	fmt.println("next")
+}
+playback_last :: proc() {
+	fmt.println("last")
 }
 
-//when ODIN_OS != .Freestanding {
-/*
-    main :: proc () {
-        // fmt.println("main")
-        ctx = context
-        //args := os.args
-        SDL.EnterAppMainCallbacks(0, nil, sdl_app_init, sdl_app_iterate, sdl_app_event, sdl_app_quit)
+
+// ClayButtonHandlerType :: #type proc(id: clay.ElementId, pointerData: clay.PointerData, userdata: rawptr)
+ButtonHandlerType :: #type proc(userdata: rawptr)
+
+HandlerInfo :: struct {
+	handler: ButtonHandlerType,
+	ctx: runtime.Context,
+	data: rawptr,
+}
+
+button_handler :: proc(a: clay.ElementId, b: clay.PointerData, c: rawptr) {
+	if (b.state == .PressedThisFrame) {
+		fmt.println("Just pressed!")
+	}
+}
+
+HandleButton :: proc "c" (id: clay.ElementId, pointerData: clay.PointerData, userData: rawptr) {
+	if (pointerData.state == .PressedThisFrame) {
+
+		handler_data := (^HandlerInfo)(userData)
+		context = handler_data.ctx
+		if handler_data.handler != nil {
+			handler_data.handler(handler_data.data)
+		}
+	}
+}
+
+// Re-useable components are just normal procs.
+sidebar_item_component :: proc($label: string, callback: ButtonHandlerType = nil, user_data: rawptr = nil) {
+    sidebar_item_layout := clay.LayoutConfig {
+        sizing = {
+            width = clay.SizingFixed(50),
+            height = clay.SizingFixed(50),
+        },
     }
-*/
-//}
+
+	colors := []clay.Color {COLOR_ORANGE, COLOR_ORANGE_LIGHT}
+	if clay.UI(clay.ID(label))({
+        layout = sidebar_item_layout,
+        backgroundColor = colors[clay.Hovered() ? 1 : 0],
+    }) {
+
+		if callback != nil {
+			info := new(HandlerInfo, context.temp_allocator)
+			info.handler = callback
+			info.ctx = context
+			info.data = user_data
+			clay.OnHover(HandleButton, info)
+		}
+		clay.Text(
+            label,
+            clay.TextConfig({ textColor = COLOR_RED, fontSize = 16 }),
+        )
+	}
+}
+
+
